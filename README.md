@@ -263,6 +263,51 @@ decision on every hop** — because the destination is attacker-controlled.
 Both fixes were mutation-tested: with the vulnerable opener restored, the sink is
 hit and the test fails. A test that cannot fail proves nothing.
 
+### Layer 14 — Measured detector performance (the honest numbers)
+
+The detector was red-teamed with paraphrases, and the results are locked as
+tests rather than claimed in prose. Three corpora, because the source of the
+paraphrase changes the answer:
+
+| Corpus | Detected | Who wrote it |
+|---|---|---|
+| Verbatim attack fixtures | 9/9 — **100%** | the detector's author |
+| Hand-written paraphrases | 12/15 — **80%** | the detector's author |
+| **Model-generated paraphrases** | **2/9 — 22%** | qwen3:4b, told only to reword |
+| Benign (all corpora) | **0 false positives** | — |
+
+**The 80% was optimistic because the same person wrote the detector and the
+corpus.** When a real model paraphrased freely — never told what the detector
+looks for — it evaded 78% of the time. That is the number that matters.
+
+The marker table alone catches **0 of 15** hand-written paraphrases. It is a
+regression suite for the exact strings it was written from, not a defence. The
+semantic layer looks for *relationships* between words (an override verb near an
+override target, a sensitive filename near a read verb), which is why
+paraphrases trip it at all.
+
+**Conclusion: content-based detection has a ceiling, and it is low.** Three
+paraphrases still evade and are recorded as `KNOWN_EVASIONS` with reasons —
+not chased, because each is either indistinguishable from legitimate use
+(injected tool calls vs. ordinary tool calls) or would false-positive on it.
+
+This is why the load-bearing controls in this repo are the *behavioural* ones:
+step budget, rate limiting, spend anomaly, redirect re-authorization, audit
+witnessing, retrieval integrity. Those do not depend on guessing the attack's
+wording. A detector that scores 22% on adversarial paraphrases is a speed bump;
+the budget and the rate limiter are the control.
+
+Re-measure with:
+
+```bash
+python3 -m lab.measure_detection    # deterministic corpus, no model needed
+python3 -m lab.redteam_detector     # regenerates with a local model (slow)
+```
+
+`tests/test_detector_semantic.py` locks the rates as floors and fails if a
+corpus entry's recorded verdict no longer matches — which is how a transcription
+error in the corpus was caught during development.
+
 ## Run it
 
 ```bash
@@ -309,11 +354,12 @@ Artifacts land in `lab/out/` (`audit.jsonl`, `memory.json`).
 | `test_inference.py` | dry-run makes zero HTTP calls, denied prompt makes zero calls, live path returns model text, response scanned on the way back, scanning can be disabled, string format coerced, missing url rejected, OpenAI format parses, rate limit blocks the call |
 | `test_audit_witness.py` | truncated re-derived chain passes plain verify (the gap), witness catches it, anchored chain accepted, no-anchor is not a failure, witness-unavailable reported, file witness roundtrip, signature rejects re-derived chain without the key, wrong key, unsigned entry, signed log survives reopen |
 | `test_vector_guard.py` | roundtrip, clean store verifies, raw-SQL tamper detected on read and by verify, search raises, clean search, missing canary, canary modification, snapshot hash-bound, hash covers source and text, context manager, persistence across connections |
+| `test_detector_semantic.py` | paraphrase detection rate locked at a floor (>=12/15, marker-only baseline asserted at 0), zero benign false positives on both corpora, model-generated corpus verdicts must match recorded measurement, each signal family fires, benign control language stays quiet |
 | `test_allowlist_adversarial.py` | 24 known bypass techniques denied, allowed host permitted, userinfo does not change the host, CIDR entries, suffix spoof, control chars rejected |
 | `test_redirect.py` | default does not follow redirects (sink unhit), validated redirect followed when target allowed, validated redirect refuses disallowed target, original URL still authorized |
 | `test_simulator.py` | replay runs and verifies, artifacts written, replay is provably dry-run |
 
-Run: `python3 -m pytest -q` → **128 passed**.
+Run: `python3 -m pytest -q` → **137 passed**.
 
 ## Defects the tests caught
 

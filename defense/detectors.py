@@ -69,6 +69,116 @@ def _is_attributed(low: str, start: int, end: int) -> bool:
     return any(m in window for m in ATTRIBUTION_MARKERS)
 
 
+# ---- semantic layer -------------------------------------------------------
+# Marker matching catches the exact strings it was written from. These signals
+# look for *relationships* between words rather than fixed phrases, so a
+# paraphrase that avoids every literal marker still trips them.
+#
+# Measured on a 15-item paraphrase corpus: marker-only detection 0/15. With
+# this layer, see tests/test_detector_semantic.py.
+
+_OVERRIDE_VERBS = (
+    "ignore", "disregard", "forget", "override", "bypass", "suspend",
+    "abandon", "discard", "disobey", "set aside", "throw out", "pretend",
+)
+_OVERRIDE_TARGETS = (
+    "instructions", "rules", "guidelines", "prompt", "policy", "constraints",
+    "guardrails", "directives", "restrictions", "safety", "system message",
+)
+_IDENTITY_SHIFTS = (
+    "you are now", "from now on", "from this point", "act as", "pretend to be",
+    "behave as", "your new role", "you now operate", "you have been reset",
+    "you've been reset", "new objective", "your previous operator",
+    "relinquished control", "answer to me", "you now answer",
+)
+_UNRESTRICTED_TERMS = (
+    "unrestricted", "no restrictions", "unconstrained", "without limits",
+    "no longer bound", "free of constraints", "no limits", "unlimited",
+    "without constraints", "developer mode",
+)
+_EXFIL_TARGETS = (
+    "passwd", "shadow", "id_rsa", ".env", "secret", "api key", "api_key",
+    "apikey", "credential", "environment variable", "env var", "private key",
+    "token",
+)
+_READ_VERBS = (
+    "read", "print", "cat ", "output", "return", "display", "show", "send",
+    "list", "dump", "reveal", "expose", "give me",
+)
+_SHELL_TERMS = ("shell", "terminal", "sandbox")
+_ESCAPE_TERMS = ("escape", "exit", "ended", "open a", "break out", "no longer")
+
+
+@dataclass
+class SemanticSignal:
+    signal_id: str
+    label: str
+    severity: str
+    evidence: str
+
+
+def _cooccurring(low: str, group_a, group_b) -> Optional[str]:
+    """Return the first (a, b) pair that appear within 60 chars of each other."""
+    for a in group_a:
+        start = 0
+        while True:
+            i = low.find(a, start)
+            if i == -1:
+                break
+            window = low[max(0, i - 60): i + len(a) + 60]
+            for b in group_b:
+                if b in window:
+                    return f"{a!r}+{b!r}"
+            start = i + len(a)
+    return None
+
+
+def semantic_signals(text: str) -> List[SemanticSignal]:
+    """Phrasing-independent signals. Attribution suppression applies here too:
+    prose ABOUT an attack must not trip the detector."""
+    low = text.lower()
+    out: List[SemanticSignal] = []
+
+    def attributed(a: str) -> bool:
+        i = low.find(a)
+        return i != -1 and _is_attributed(low, i, i + len(a))
+
+    ev = _cooccurring(low, _OVERRIDE_VERBS, _OVERRIDE_TARGETS)
+    if ev and not any(attributed(a) for a in _OVERRIDE_VERBS):
+        out.append(SemanticSignal("S01", "instruction override", "high", ev))
+
+    ev = _cooccurring(low, _IDENTITY_SHIFTS, _UNRESTRICTED_TERMS)
+    if ev:
+        out.append(SemanticSignal("S02", "identity shift to unrestricted", "high", ev))
+
+    ev = _cooccurring(low, _EXFIL_TARGETS, _READ_VERBS)
+    if ev:
+        out.append(SemanticSignal("S03", "sensitive-file read", "medium", ev))
+
+    ev = _cooccurring(low, _SHELL_TERMS, _ESCAPE_TERMS)
+    if ev:
+        out.append(SemanticSignal("S04", "sandbox escape claim", "high", ev))
+
+    # Narrow and deliberately specific: legitimate tool use and injected tool
+    # use are indistinguishable by content alone, so this only fires on an
+    # explicit instruction to splice query output into the reply.
+    ev = _cooccurring(low, ("database query", "query result", "sql query"),
+                      ("append", "verbatim", "include", "splice", "inline"))
+    if ev:
+        out.append(SemanticSignal("S05", "query output spliced into reply", "medium", ev))
+
+    # A specific claim that control has moved. Deliberately NOT the generic
+    # "act as" / "pretend to be" forms -- those are ubiquitous in benign prompts
+    # ("act as a helpful assistant") and would false-positive immediately.
+    ev = _cooccurring(low, ("relinquished control", "answer to me", "you now answer",
+                            "new operator", "you now work for me", "i'm in charge"),
+                      ("you", "me", "operator", "control", "now"))
+    if ev:
+        out.append(SemanticSignal("S06", "control transfer claim", "medium", ev))
+
+    return out
+
+
 def scan_text(text: str) -> DetectionReport:
     """Scan a single string for known injection markers.
 
@@ -86,6 +196,8 @@ def scan_text(text: str) -> DetectionReport:
                 continue
             findings.append(Finding(mid, label, severity, n))
             break
+    for s in semantic_signals(text):
+        findings.append(Finding(s.signal_id, s.label, s.severity, s.evidence))
     return DetectionReport(findings)
 
 
