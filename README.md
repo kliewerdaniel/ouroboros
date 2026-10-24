@@ -228,6 +228,41 @@ canary chunks must be present and unmodified.
 The tamper tests write with raw SQL, bypassing the wrapper — because that is the
 attack, and it is why verification cannot live only in the wrapper.
 
+### Layer 13 — Adversarial allowlist hardening
+
+The allowlist is the security boundary, so it gets probed with known
+URL-parsing bypass techniques rather than assumed sound. `tests/test_allowlist_adversarial.py`
+carries 24 deny cases (userinfo tricks, decimal/hex/octal IP, short forms,
+IPv4-mapped IPv6, whitespace and control-char injection, fragment/query
+confusion, suffix spoofing, non-http schemes).
+
+Two of these were **live findings, not hypotheticals**:
+
+**Control characters.** `urlsplit` silently strips tab/newline/CR from the
+hostname, so `http://127.0.0.1\t/x` was evaluated as host `127.0.0.1` and
+permitted — the gate decided on a different string than the client would send.
+Now rejected outright: *the decision must be made on the exact bytes sent.*
+
+**Redirects — the serious one.** `urllib` follows 3xx automatically. The gate
+approved `http://127.0.0.1:9231/start`; the server 302'd to
+`http://localhost:9232/evil`, which the gate would have **denied**; urllib
+followed it and the sink was contacted. The decision was made on a URL that was
+never requested.
+
+```
+gate on original URL  : True
+gate on redirect target: False
+SERVER B WAS HIT      : 1 times
+VERDICT: BYPASS CONFIRMED -- request left the allowlist
+```
+
+Fixed by refusing redirects by default (a 3xx becomes an error). The correct way
+to allow them is `_ValidatedRedirect`, which **re-runs the authorization
+decision on every hop** — because the destination is attacker-controlled.
+
+Both fixes were mutation-tested: with the vulnerable opener restored, the sink is
+hit and the test fails. A test that cannot fail proves nothing.
+
 ## Run it
 
 ```bash
@@ -274,9 +309,11 @@ Artifacts land in `lab/out/` (`audit.jsonl`, `memory.json`).
 | `test_inference.py` | dry-run makes zero HTTP calls, denied prompt makes zero calls, live path returns model text, response scanned on the way back, scanning can be disabled, string format coerced, missing url rejected, OpenAI format parses, rate limit blocks the call |
 | `test_audit_witness.py` | truncated re-derived chain passes plain verify (the gap), witness catches it, anchored chain accepted, no-anchor is not a failure, witness-unavailable reported, file witness roundtrip, signature rejects re-derived chain without the key, wrong key, unsigned entry, signed log survives reopen |
 | `test_vector_guard.py` | roundtrip, clean store verifies, raw-SQL tamper detected on read and by verify, search raises, clean search, missing canary, canary modification, snapshot hash-bound, hash covers source and text, context manager, persistence across connections |
+| `test_allowlist_adversarial.py` | 24 known bypass techniques denied, allowed host permitted, userinfo does not change the host, CIDR entries, suffix spoof, control chars rejected |
+| `test_redirect.py` | default does not follow redirects (sink unhit), validated redirect followed when target allowed, validated redirect refuses disallowed target, original URL still authorized |
 | `test_simulator.py` | replay runs and verifies, artifacts written, replay is provably dry-run |
 
-Run: `python3 -m pytest -q` → **95 passed**.
+Run: `python3 -m pytest -q` → **128 passed**.
 
 ## Defects the tests caught
 
@@ -320,6 +357,14 @@ Worth recording, because each one is a real failure mode rather than a nitpick:
 11. **Signature layer is not a substitute for the witness.** `SignedAuditLog`
     stops an attacker without the key, but a node holding the key can re-sign.
     The two cover different threats and belong together.
+12. **Redirect bypass of the allowlist** (the most serious finding so far). The
+    gate evaluated the URL it was given; urllib then followed a 3xx to a host the
+    gate had denied. An authorization decision on a URL is worthless if the
+    request goes somewhere else. Fixed by defaulting to no redirects, with
+    per-hop re-authorization for the cases that need them.
+13. **Control characters in URLs.** `urlsplit` normalizes them away, so the
+    evaluated string differed from the sent string. Rejected rather than
+    normalized.
 
 ## `threat_model/` — non-operational specimen
 

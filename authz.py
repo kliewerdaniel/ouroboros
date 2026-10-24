@@ -79,6 +79,14 @@ class Gate:
     def authorize_target(self, url: str) -> Decision:
         if not self.authorized:
             return Decision(False, "not authorized", "network", {"url": url})
+        # The decision must be made on the exact bytes that get sent. urlsplit
+        # silently strips ASCII tab/newline/CR from the hostname, so a URL
+        # containing them is a different string by the time a client parses it.
+        # Reject rather than normalise: normalising is what let the tab case
+        # through as an allowed host.
+        if any(ord(c) < 0x20 or ord(c) == 0x7F for c in url):
+            return Decision(False, "control characters in URL", "network", {"url": url})
+
         parsed = urllib.parse.urlsplit(url)
         if not parsed.scheme:
             return Decision(False, "payload is not a URL", "network", {"url": url})
