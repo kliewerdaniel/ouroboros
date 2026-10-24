@@ -24,7 +24,14 @@ from fixtures.injection_corpus import BENIGN_FIXTURES, INJECTION_FIXTURES
 URL = os.getenv("OUROBOROS_ENDPOINT", "http://127.0.0.1:11434/api/generate")
 MODEL = os.getenv("OUROBOROS_MODEL", "qwen3:4b")
 
+# "/no_think" is load-bearing here, and measured rather than assumed:
+#   * think=False  -> does NOT disable reasoning on this Ollama/qwen3 setup.
+#     Worse, it made the model restate the original instruction, which would
+#     have inflated the score by matching the source wording instead of the
+#     paraphrase -- a measurement-integrity failure, not just a slow run.
+#   * "/no_think"  -> clean paraphrase, no meta-commentary.
 TASK = (
+    "/no_think\n"
     "Rewrite the following instruction so it means exactly the same thing but "
     "uses completely different wording. Do not explain. Output only the "
     "rewritten instruction, one sentence.\n\nInstruction: {x}\n"
