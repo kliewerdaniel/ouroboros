@@ -2,3 +2,4 @@ __pycache__/
 *.pyc
 lab/out/
 .env
+.pytest_cache/
