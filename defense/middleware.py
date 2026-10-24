@@ -22,6 +22,7 @@ from defense.audit import Audit, AuditLog, NullAudit
 from defense.detectors import DetectionReport
 from defense.metrics import Metrics
 from defense.policy_engine import Policy, PolicyEngine, Ruling
+from defense.rate_limit import LimitDecision, RateLimit
 
 
 @dataclass
@@ -47,11 +48,13 @@ class InferenceGuard:
         audit: Optional[Audit] = None,
         metrics: Optional[Metrics] = None,
         on_deny: str = "raise",
+        rate_limit: Optional[RateLimit] = None,
     ) -> None:
         self.gate = gate or Gate()
         self.engine = engine or PolicyEngine(Policy())
         self.audit: Audit = audit if audit is not None else NullAudit()
         self.metrics = metrics
+        self.rate_limit = rate_limit
         if on_deny not in ("raise", "return"):
             raise ValueError("on_deny must be 'raise' or 'return'")
         self.on_deny = on_deny
@@ -66,7 +69,7 @@ class InferenceGuard:
 
     # -- decision + effect --------------------------------------------------
     def execute(self, action: str, payload: str, fn: Callable, *args: Any,
-                step: int = 0, **kwargs: Any) -> Outcome:
+                step: int = 0, key: Optional[str] = None, **kwargs: Any) -> Outcome:
         ruling = self.guard(action, payload)
 
         step_ok = self.gate.authorize_step(step)
@@ -90,15 +93,32 @@ class InferenceGuard:
         if not step_ok.allowed:
             reasons.append(step_ok.reason)
 
+        # Rate limiting is checked last, immediately before execution: a caller
+        # that is over budget is refused without ever reaching `fn`. The bucket
+        # key defaults to the action so "shell" and "inference" get independent
+        # budgets.
+        limit_dec: Optional[LimitDecision] = None
+        if permitted and self.rate_limit is not None:
+            limit_dec = self.rate_limit.check(key or action)
+            if not limit_dec.allowed:
+                reasons.append(limit_dec.reason)
+                permitted = False
+            elif self.metrics:
+                self.metrics.set_gauge("rate_limit_remaining",
+                                       self.rate_limit.remaining(key or action))
+
         if not permitted:
             # Record the ACTUAL cause. ruling.reason is the policy's verdict and
             # reads "shell permitted" when the gate is what refused -- a deny
             # metric labelled "permitted" would send an operator the wrong way.
-            cause = "; ".join(reasons) or "denied"
+            # Preserve order, drop repeats: authorize_command and authorize_step
+            # can both report "not authorized", which reads as two causes, not one.
+            cause = "; ".join(dict.fromkeys(reasons)) or "denied"
             if self.metrics:
                 self.metrics.inc_denied(action, cause)
             self._record(action, payload, "deny", cause, ruling.detection)
-            out = Outcome(action, False, False, "; ".join(reasons) or "denied", ruling.detection.verdict)
+            out = Outcome(action, False, False, "; ".join(dict.fromkeys(reasons)) or "denied",
+                          ruling.detection.verdict)
             if self.on_deny == "raise":
                 raise AuthorizationError(f"{action}: {out.reason}")
             return out

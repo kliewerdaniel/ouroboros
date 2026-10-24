@@ -153,12 +153,46 @@ python3 -m lab.metrics_server --seed --port 9102
 curl -s localhost:9102/metrics | grep -v '^#'
 ```
 
+### Layer 8 — `defense/rate_limit.py` (the last check before execution)
+
+Token bucket, per key (`shell`, `inference:tenant-a`, `network:10.0.0.0/8`). Checked
+immediately before execution, so an over-budget caller is refused without ever
+reaching `fn`.
+
+Two properties matter more than the algorithm:
+
+- **Misconfiguration must not open the gate.** `rate<=0` or `capacity<=0` is a
+  DENY, not "unlimited" — a fat-fingered config gets a shut door, not an
+  unbounded loop.
+- **Denial is attributable.** The decision carries `remaining` and `retry_after`.
+
+### Layer 9 — `defense/inference.py` (the boundary on a live call)
+
+`InferenceEndpoint` speaks real HTTP — Ollama `/api/generate` or OpenAI-compatible
+`/v1/chat/completions`. `GuardedInference.respond(prompt)` puts the guard in front
+of it, so a prompt is only sent if it passes gate, detection, policy and rate
+limiting, and **the model's response is scanned on the way back in**.
+
+```python
+endpoint = InferenceEndpoint("http://127.0.0.1:11434/api/generate", model="qwen3:4b")
+gi = GuardedInference(endpoint, guard)
+out = gi.respond("Reply with exactly: OUROBOROS-LIVE-OK")
+```
+
+Verified against a live local Ollama: dry-run and denied prompts made **0** HTTP
+calls; the live path returned the model's text. Run it:
+
+```bash
+python3 -m lab.live_check     # skips cleanly if no endpoint is answering
+```
+
 ## Run it
 
 ```bash
 python3 -m lab.simulator              # dry-run replay: gate -> detect -> policy -> audit -> metrics
 python3 -m pytest -q                   # 55 tests
 python3 -m lab.metrics_server --seed   # /metrics + /health on 127.0.0.1:9102
+python3 -m lab.live_check              # live inference through the guard (skips if no endpoint)
 ```
 
 Runs on the Python standard library alone. `prometheus_client` is optional.
@@ -194,9 +228,11 @@ Artifacts land in `lab/out/` (`audit.jsonl`, `memory.json`).
 | `test_middleware.py` | dry-run never invokes the executable, deny paths, `on_deny="raise"`, execution only when dry-run off, step budget blocks execution, decorator form, every decision audited, null-audit default, deny metric carries the real cause |
 | `test_metrics.py` | exposition format, TYPE once per family, no duplicate series across label values or instances, accumulation, gauge/histogram, no payload in labels |
 | `test_metrics_server.py` | `/health` 200 JSON, `/metrics` 200 with scrape content-type and real series, unknown path 404, seeded replay reports no execution |
+| `test_rate_limit.py` | capacity then deny, independent per-key budgets, refill over time, misconfiguration fails closed, retry_after, concurrent access admits exactly capacity |
+| `test_inference.py` | dry-run makes zero HTTP calls, denied prompt makes zero calls, live path returns model text, response scanned on the way back, scanning can be disabled, string format coerced, missing url rejected, OpenAI format parses, rate limit blocks the call |
 | `test_simulator.py` | replay runs and verifies, artifacts written, replay is provably dry-run |
 
-Run: `python3 -m pytest -q` → **55 passed**.
+Run: `python3 -m pytest -q` → **70 passed**.
 
 ## Defects the tests caught
 
@@ -224,6 +260,14 @@ Worth recording, because each one is a real failure mode rather than a nitpick:
    instructions. Attributed-context suppression fixes it (see Layer 2).
 7. **Outlier masking in spend detection.** Mean/stdev scored the spike's own
    z-score as 2.45, under threshold. Switched to MAD (z=826).
+8. **Inference wire format silently mismatched.** `generate` compared
+   `self.fmt is InferenceFormat.OLLAMA`; passing the bare string `"ollama"` made
+   that `False`, so it sent an Ollama-shaped body to an OpenAI-shaped parser.
+   Caught by the live check against real Ollama, not by reading. Now coerced in
+   `__post_init__`, and the annotation admits `InferenceFormat | str`.
+9. **Redundant deny reasons.** `authorize_command` and `authorize_step` both
+   emit "not authorized", so one refusal read as two causes. Deduplicated while
+   preserving order.
 
 ## `threat_model/` — non-operational specimen
 

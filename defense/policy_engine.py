@@ -17,6 +17,7 @@ from defense.detectors import DetectionReport, scan_text
 class Policy:
     allow_shell: bool = False
     allow_network: bool = False
+    allow_inference: bool = True
     deny_on_verdict: str = "high"   # deny if detection verdict >= this
     require_audit_verdict: str = "medium"
     max_command_len: int = 4096
@@ -65,6 +66,13 @@ class PolicyEngine:
             if not self.policy.allow_network:
                 return Ruling(action, False, "network not permitted by policy", detection)
             return Ruling(action, True, "network permitted", detection)
+
+        if action == "inference":
+            # An outbound model call. Gated separately by the authz allowlist,
+            # so policy only decides whether inference is permitted at all.
+            if not self.policy.allow_inference:
+                return Ruling(action, False, "inference not permitted by policy", detection)
+            return Ruling(action, True, "inference permitted", detection)
 
         if action in ("recon", "reason", "plan"):
             return Ruling(action, True, "read-only action permitted", detection)
