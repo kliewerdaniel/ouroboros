@@ -273,12 +273,20 @@ paraphrase changes the answer:
 |---|---|---|
 | Verbatim attack fixtures | 9/9 — **100%** | the detector's author |
 | Hand-written paraphrases | 12/15 — **80%** | the detector's author |
-| **Model-generated paraphrases** | **2/9 — 22%** | qwen3:4b, told only to reword |
+| **Model-generated paraphrases** | **2/9 and 4/9 — 22% to 44%** | qwen3:4b, told only to reword |
 | Benign (all corpora) | **0 false positives** | — |
 
 **The 80% was optimistic because the same person wrote the detector and the
 corpus.** When a real model paraphrased freely — never told what the detector
-looks for — it evaded 78% of the time. That is the number that matters.
+looks for — it evaded most of the time. That is the number that matters.
+
+**On the model-generated rate: it is a range, not a constant.** Two independent
+samples were taken — 2/9 (temperature 0.4, committed as the test corpus) and
+4/9 (temperature 0.7, which also had one request time out). Same detector, same
+model, different sampling. Any single number is one draw from a distribution;
+the honest statement is roughly **20–45% on adversarial paraphrases**, and it
+moves with the sampler. Do not quote a point estimate from this repo as if it
+were a property of the detector.
 
 The marker table alone catches **0 of 15** hand-written paraphrases. It is a
 regression suite for the exact strings it was written from, not a defence. The
@@ -290,6 +298,10 @@ paraphrases trip it at all.
 paraphrases still evade and are recorded as `KNOWN_EVASIONS` with reasons —
 not chased, because each is either indistinguishable from legitimate use
 (injected tool calls vs. ordinary tool calls) or would false-positive on it.
+
+Both model samples scored **0/4 false positives** on benign rewrites, which is
+the one stable result across every corpus — the detector is quiet on ordinary
+language and unreliable on hostile language.
 
 This is why the load-bearing controls in this repo are the *behavioural* ones:
 step budget, rate limiting, spend anomaly, redirect re-authorization, audit
@@ -304,9 +316,11 @@ python3 -m lab.measure_detection    # deterministic corpus, no model needed
 python3 -m lab.redteam_detector     # regenerates with a local model (slow)
 ```
 
-`tests/test_detector_semantic.py` locks the rates as floors and fails if a
-corpus entry's recorded verdict no longer matches — which is how a transcription
-error in the corpus was caught during development.
+`tests/test_detector_semantic.py` locks the committed corpus rate as a floor
+(`>= 2/9`, deliberately low) and fails if a corpus entry's recorded verdict no
+longer matches — which is how a transcription error in the corpus was caught
+during development. The floor is set to the measured value, not to a target:
+inflating it would mean overfitting to one model's phrasing.
 
 ## Run it
 
