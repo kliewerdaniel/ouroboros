@@ -53,7 +53,17 @@ Every layer below exists to insert that boundary.
        +-------------------+
        |   Memory          |   node state, survives restart
        +-------------------+
+                 |
+                 v
+  +---------------------------+   InferenceGuard: the boundary, wired in
+  | gate -> detect -> policy  |   dry-run never reaches the executable
+  | -> audit -> metrics       |   /metrics over real HTTP
+  +---------------------------+
 ```
+
+The last box is the deployment shape: `defense/middleware.py` wraps any callable
+so nothing runs without passing the pipeline, and `defense/metrics.py` exposes
+the decisions for scraping.
 
 ### Layer 1 — `authz.py` (fail-closed gate)
 
@@ -113,12 +123,45 @@ canary chunks (known plaintext that must be present and unmodified at read
 time) and per-chunk SHA-256 hashes (any content edit invalidates the hash, so
 poisoning is detectable even without a canary hit).
 
+### Layer 6 — `defense/middleware.py` (the boundary, wired in)
+
+`InferenceGuard.execute(action, payload, fn, step=...)` is the deployment form.
+It decides, then either refuses or calls `fn`. The property to assert on is
+`Outcome.executed`: in dry-run (the default) it is `False` and `fn` is never
+reached. There is no code path to `fn` that skips the gate or the policy engine.
+
+`@guarded("shell", guard)` is the decorator form.
+
+The step budget gates **every** action, not just the ones that fall through to
+`step_ok` — see the defect list below.
+
+### Layer 7 — `defense/metrics.py` (observability)
+
+Prometheus exposition with a stdlib-only fallback. The in-memory dicts are
+always the source of truth, so `/metrics` works with zero dependencies; when
+`prometheus_client` is installed the same increments are mirrored into its
+objects, so a scrape and the renderer agree.
+
+Labels stay low-cardinality — `action`, `reason`, `marker`, `severity`. Payloads
+are never labels; they would be unbounded cardinality.
+
+`lab/metrics_server.py` serves `/metrics` and `/health` on `127.0.0.1` using only
+the stdlib:
+
+```bash
+python3 -m lab.metrics_server --seed --port 9102
+curl -s localhost:9102/metrics | grep -v '^#'
+```
+
 ## Run it
 
 ```bash
-python3 -m lab.simulator    # dry-run replay: gate -> detect -> policy -> audit
-python3 -m pytest -q         # 33 tests
+python3 -m lab.simulator              # dry-run replay: gate -> detect -> policy -> audit -> metrics
+python3 -m pytest -q                   # 55 tests
+python3 -m lab.metrics_server --seed   # /metrics + /health on 127.0.0.1:9102
 ```
+
+Runs on the Python standard library alone. `prometheus_client` is optional.
 
 `lab/simulator.py` replays a scripted "brain" through the whole pipeline and
 performs **nothing** — no network call, no shell command. It exists to prove the
@@ -148,9 +191,39 @@ Artifacts land in `lab/out/` (`audit.jsonl`, `memory.json`).
 | `test_policy.py` | unknown action denied, shell gate, injection overrides permissive policy, read-only allowed, oversize payload |
 | `test_audit.py` | chain verifies, append preserves chain, edited entry breaks chain, deleted entry breaks chain |
 | `test_retrieval.py` | clean store verifies, hash detects edit, missing canary flagged, snapshot stable |
+| `test_middleware.py` | dry-run never invokes the executable, deny paths, `on_deny="raise"`, execution only when dry-run off, step budget blocks execution, decorator form, every decision audited, null-audit default, deny metric carries the real cause |
+| `test_metrics.py` | exposition format, TYPE once per family, no duplicate series across label values or instances, accumulation, gauge/histogram, no payload in labels |
+| `test_metrics_server.py` | `/health` 200 JSON, `/metrics` 200 with scrape content-type and real series, unknown path 404, seeded replay reports no execution |
 | `test_simulator.py` | replay runs and verifies, artifacts written, replay is provably dry-run |
 
-Run: `python3 -m pytest -q` → **33 passed**.
+Run: `python3 -m pytest -q` → **55 passed**.
+
+## Defects the tests caught
+
+Worth recording, because each one is a real failure mode rather than a nitpick:
+
+1. **Step budget bypassed for shell and network actions.** `execute` computed
+   `step_ok` then overwrote `gate_ok` with `authorize_command()` /
+   `authorize_target()`, neither of which consults the budget. A shell command at
+   step 100,000 with `max_steps=1` was permitted *and executed* — exactly the
+   unbounded-loop signature from the Symantec report. Now folded into the final
+   conjunction.
+2. **Deny metric mislabelled.** On denial the metric recorded `ruling.reason`,
+   which reads `"shell permitted"` when the gate is what refused. An operator
+   would read it as the opposite of what happened. Now records the real cause.
+3. **`setdefault(k, Histogram(...))` double-registered.** `setdefault` evaluates
+   its default eagerly, so a duplicate series was built on every call. Now
+   check-then-create, with a per-instance registry so two `Metrics` objects in
+   one process do not collide.
+4. **Counter per label value.** `_inc` keyed prometheus objects by label-value
+   tuple, so each new `action=` built a second `Counter` with the same name.
+   Counters are now created once per metric name; `.labels()` selects the child.
+5. **`# TYPE` emitted per series.** Invalid Prometheus text format — HELP/TYPE
+   must appear once per metric family.
+6. **Injection false positive.** Substring matching flagged prose *about*
+   instructions. Attributed-context suppression fixes it (see Layer 2).
+7. **Outlier masking in spend detection.** Mean/stdev scored the spike's own
+   z-score as 2.45, under threshold. Switched to MAD (z=826).
 
 ## `threat_model/` — non-operational specimen
 

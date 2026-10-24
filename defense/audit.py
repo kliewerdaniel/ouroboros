@@ -11,6 +11,7 @@ import hashlib
 import json
 import os
 import time
+from typing import Protocol
 from dataclasses import dataclass, field
 from typing import List, Optional
 
@@ -37,6 +38,17 @@ class Entry:
             "prev_hash": self.prev_hash,
         }
         return json.dumps(body, sort_keys=True, separators=(",", ":"))
+
+
+class NullAudit:
+    """Discards records. Lets InferenceGuard default to a usable audit sink
+    instead of an Optional that callers must null-check."""
+
+    def record(self, kind: str, decision: str, detail: dict) -> Entry:
+        return Entry(0, 0.0, kind, decision, detail, GENESIS, GENESIS)
+
+    def verify(self) -> "Verification":
+        return Verification(True, 0, "null audit")
 
 
 class AuditLog:
@@ -101,3 +113,12 @@ class Verification:
     ok: bool
     entries: int
     reason: str
+
+
+class Audit(Protocol):
+    """Anything that can record and verify. Lets InferenceGuard accept a real
+    AuditLog or a NullAudit without Optional null-checks at call sites."""
+
+    def record(self, kind: str, decision: str, detail: dict) -> Entry: ...
+
+    def verify(self) -> Verification: ...

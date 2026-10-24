@@ -1,3 +1,4 @@
-
-requests
-python-dotenv
+# Ouroboros runs on the Python standard library alone.
+# prometheus_client is optional: without it, Metrics falls back to its own
+# in-memory exposition and /metrics still works.
+prometheus_client>=0.19

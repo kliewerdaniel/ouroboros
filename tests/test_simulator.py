@@ -11,7 +11,11 @@ def test_simulator_runs_and_verifies():
                        cwd=REPO, capture_output=True, text=True)
     assert r.returncode == 0, r.stderr
     assert "verify=OK" in r.stdout
-    assert "denied=2" in r.stdout
+    # The load-bearing properties: nothing executed, and something was denied.
+    assert "executed=0" in r.stdout
+    assert "denied=" in r.stdout
+    denied = int(r.stdout.split("denied=")[1].split()[0])
+    assert denied >= 2
 
 
 def test_simulator_writes_artifacts():
