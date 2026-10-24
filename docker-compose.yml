@@ -1,0 +1,26 @@
+
+version: '3.8'
+services:
+  victim-ollama:
+    image: ollama/ollama
+    container_name: victim-ollama
+    ports:
+      - "11434:11434"
+    environment:
+      - OLLAMA_HOST=0.0.0.0
+    volumes:
+      - ollama_data:/root/.ollama
+
+  attacker-parasite:
+    build: .
+    container_name: attacker-parasite
+    environment:
+      - HIJACKED_ENDPOINT=http://victim-ollama:11434/api/generate
+      - HIJACKED_API_KEY=dummy_key
+    depends_on:
+      - victim-ollama
+    volumes:
+      - .:/app
+
+volumes:
+  ollama_data:
