@@ -40,6 +40,14 @@ def main() -> int:
     out_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "out")
     os.makedirs(out_dir, exist_ok=True)
 
+    # Lab convenience only: reset the replay log so a run is reproducible.
+    # A production audit log is NEVER truncated -- see tests/test_audit.py,
+    # which asserts that appending preserves the chain. Do not copy this line
+    # into anything that actually logs.
+    audit_path = os.path.join(out_dir, "audit.jsonl")
+    if os.path.exists(audit_path):
+        os.remove(audit_path)
+
     # Deliberately permissive-looking policy, to show deny is driven by
     # DETECTION and the GATE rather than by a trivially strict policy.
     gate = Gate(authorized=True, dry_run=True, allow_hosts=["127.0.0.1"], max_steps=4)
