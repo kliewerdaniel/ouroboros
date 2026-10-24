@@ -186,6 +186,48 @@ calls; the live path returned the model's text. Run it:
 python3 -m lab.live_check     # skips cleanly if no endpoint is answering
 ```
 
+### Layer 10 — Witness anchoring (the truncation defense)
+
+Hash chaining proves the chain is **internally consistent** — which a
+truncated-and-re-derived chain also is. That is a real gap, not a theoretical
+one:
+
+```
+after truncation: 4 entries, head=444211f106fc1c3d
+  plain verify:    ok=True   <-- chain is internally consistent
+  witness verify:  ok=False
+                   reason=anchored head 7e090780e84e not in chain -- log truncated or replaced
+```
+
+The fix is to publish the head to a sink the node cannot rewrite.
+`verify_with_witness(w)` compares the anchored head against the chain; if it is
+no longer reachable, entries were removed. `InferenceGuard` anchors automatically
+when given a witness.
+
+`FileWitness` is same-host (defends against accidental loss, not a compromised
+box). `CallbackWitness` ships the head to WORM storage or a ledger — that is the
+deployment that actually defeats a compromised node.
+
+### Layer 11 — Signed entries (a different threat)
+
+`SignedAuditLog` adds an HMAC the verifier recomputes. This does **not** replace
+the witness — it covers a different attacker: one who can tamper with the file
+but does not hold the signing key. If the key lives on the node, a compromised
+node can re-sign; pair the two.
+
+Demonstrated: an attacker who edits an early entry *and* rebuilds the hash chain
+defeats the hash layer entirely (`AuditLog.verify()` passes). Only the signature
+still fails.
+
+### Layer 12 — `defense/vector_guard.py` (integrity over a real store)
+
+SQLite-backed chunk store where every chunk carries `SHA-256(source, text)`,
+verified on read. A tampered chunk **raises** rather than being returned, and
+canary chunks must be present and unmodified.
+
+The tamper tests write with raw SQL, bypassing the wrapper — because that is the
+attack, and it is why verification cannot live only in the wrapper.
+
 ## Run it
 
 ```bash
@@ -230,9 +272,11 @@ Artifacts land in `lab/out/` (`audit.jsonl`, `memory.json`).
 | `test_metrics_server.py` | `/health` 200 JSON, `/metrics` 200 with scrape content-type and real series, unknown path 404, seeded replay reports no execution |
 | `test_rate_limit.py` | capacity then deny, independent per-key budgets, refill over time, misconfiguration fails closed, retry_after, concurrent access admits exactly capacity |
 | `test_inference.py` | dry-run makes zero HTTP calls, denied prompt makes zero calls, live path returns model text, response scanned on the way back, scanning can be disabled, string format coerced, missing url rejected, OpenAI format parses, rate limit blocks the call |
+| `test_audit_witness.py` | truncated re-derived chain passes plain verify (the gap), witness catches it, anchored chain accepted, no-anchor is not a failure, witness-unavailable reported, file witness roundtrip, signature rejects re-derived chain without the key, wrong key, unsigned entry, signed log survives reopen |
+| `test_vector_guard.py` | roundtrip, clean store verifies, raw-SQL tamper detected on read and by verify, search raises, clean search, missing canary, canary modification, snapshot hash-bound, hash covers source and text, context manager, persistence across connections |
 | `test_simulator.py` | replay runs and verifies, artifacts written, replay is provably dry-run |
 
-Run: `python3 -m pytest -q` → **70 passed**.
+Run: `python3 -m pytest -q` → **95 passed**.
 
 ## Defects the tests caught
 
@@ -268,6 +312,14 @@ Worth recording, because each one is a real failure mode rather than a nitpick:
 9. **Redundant deny reasons.** `authorize_command` and `authorize_step` both
    emit "not authorized", so one refusal read as two causes. Deduplicated while
    preserving order.
+10. **The audit log's truncation gap** (design, not a bug): hash chaining cannot
+    detect a log that was shortened and re-derived, because the result is still
+    internally consistent. Closed by witness anchoring — the head is published
+    to a sink the node cannot rewrite, so a shorter replacement chain is
+    detectable. Demonstrated in `tests/test_audit_witness.py`.
+11. **Signature layer is not a substitute for the witness.** `SignedAuditLog`
+    stops an attacker without the key, but a node holding the key can re-sign.
+    The two cover different threats and belong together.
 
 ## `threat_model/` — non-operational specimen
 

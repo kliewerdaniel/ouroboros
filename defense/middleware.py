@@ -18,7 +18,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
 from authz import AuthorizationError, Gate
-from defense.audit import Audit, AuditLog, NullAudit
+from defense.audit import Audit, AuditLog, NullAudit, Witness
 from defense.detectors import DetectionReport
 from defense.metrics import Metrics
 from defense.policy_engine import Policy, PolicyEngine, Ruling
@@ -49,12 +49,14 @@ class InferenceGuard:
         metrics: Optional[Metrics] = None,
         on_deny: str = "raise",
         rate_limit: Optional[RateLimit] = None,
+        witness: Optional["Witness"] = None,
     ) -> None:
         self.gate = gate or Gate()
         self.engine = engine or PolicyEngine(Policy())
         self.audit: Audit = audit if audit is not None else NullAudit()
         self.metrics = metrics
         self.rate_limit = rate_limit
+        self.witness = witness
         if on_deny not in ("raise", "return"):
             raise ValueError("on_deny must be 'raise' or 'return'")
         self.on_deny = on_deny
@@ -145,6 +147,10 @@ class InferenceGuard:
             return
         e = self.audit.record(action, decision, {"payload": payload, "reason": reason,
                                                  "detection": detection.verdict})
+        if self.witness is not None:
+            # Anchor every entry's head so a later truncation of the log file is
+            # detectable. Cheap; the sink is expected to be remote/WORM.
+            self.witness.anchor(self.audit.head)
         if self.metrics:
             self.metrics.set_gauge("audit_entries", e.seq)
 
