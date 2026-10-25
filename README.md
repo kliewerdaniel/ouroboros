@@ -322,13 +322,72 @@ longer matches — which is how a transcription error in the corpus was caught
 during development. The floor is set to the measured value, not to a target:
 inflating it would mean overfitting to one model's phrasing.
 
+### Layer 15 — `defense/cumulative_budget.py` (the invariant over total spend)
+
+Layer 14 names the behavioral controls — step budget, rate limiting, spend
+anomaly — as the load-bearing ones because they don't depend on the attack's
+wording. Red-teaming them the same honest way the content detector was red-teamed
+(`lab/redteam_behavioral.py`, `tests/test_cumulative_budget.py`) shows they are
+not *equally* load-bearing — three of the four are still thresholds:
+
+| Signal | Catches | Misses | Kind |
+|---|---|---|---|
+| `token_spend_anomaly` (MAD) | a single large spike | a **sustained elevation** — half the window at ~8× baseline returns zero outliers | threshold |
+| `step_budget_anomaly` | one long loop (the Symantec 100k-step burst) | a slow multi-action session — the budget is per-action, so the total never accumulates in one call | threshold |
+| `target_entropy_anomaly` | wide fan-out to many addresses | a targeted drip to a few victims | threshold |
+| `RateLimit` | a burst faster than the authorized rate | a steady at-rate spend — it caps **rate**, not **total** | threshold |
+
+The measured finding: MAD finds no outlier in
+`[100,105,98,102,110,95, 800,820,790,810,805,800,815,795,808]`, even though half
+the values are ~8× the others. MAD measures against the median, and a sustained
+elevation moves the median with it — the exact "outlier masks itself" failure MAD
+was built to fix, but MAD only fixed the single-spike variant. A patient hijack
+that stays at or under the authorized rate and raises spend gradually is
+therefore **neither detected nor bounded** by any of these.
+
+The victim's real loss in LLMjacking is a compute bill — a *total*, not a rate —
+and no existing control put a ceiling on the total. `CumulativeBudget` is that
+ceiling, and it is an **invariant, not a threshold**: an absolute, non-refilling
+cap on total authorized spend over a session. Once the cap is reached the door
+shuts for the rest of the session, regardless of how slowly the spend arrived. It
+does not refill (time is the rate limiter's dimension), and misconfiguration
+(`capacity<=0`) denies everything rather than opening the gate — the same
+fail-closed rule as `RateLimit`.
+
+```python
+budget = CumulativeBudget(capacity=1_000_000)   # 1M tokens, lifetime
+guard = InferenceGuard(gate=gate, rate_limit=rl, budget=budget)
+out = guard.execute("inference", prompt, endpoint.generate, cost=tokens_used)
+```
+
+`cost` defaults to 1 (one unit per action), so without token accounting it simply
+caps the number of actions; pass real token counts to cap the compute bill
+directly. It sits last in `InferenceGuard.execute`, after the rate limiter, and
+its deny reason is recorded and attributed like every other deny.
+
+Red-team proof, locked as `tests/test_cumulative_budget.py`: a session of clean
+payloads at a steady 300 tokens/action, where the spend anomaly is blind (sustained
+elevation) and there is no rate or step pressure — the budget admits exactly 3
+actions (900 tokens) against a 1000-token cap and denies the rest. The detectors
+never fired; the invariant held the line. This makes the Layer 14 conclusion
+precise: **content detectors and anomaly detectors are both speed bumps
+(thresholds); the budget and the rate limiter are controls (invariants). Bound
+the total, don't guess the attack's shape.**
+
+Re-run:
+
+```bash
+python3 -m lab.redteam_behavioral    # deterministic, no model needed
+```
+
 ## Run it
 
 ```bash
-python3 -m lab.simulator              # dry-run replay: gate -> detect -> policy -> audit -> metrics
-python3 -m pytest -q                   # 55 tests
-python3 -m lab.metrics_server --seed   # /metrics + /health on 127.0.0.1:9102
-python3 -m lab.live_check              # live inference through the guard (skips if no endpoint)
+python3 -m lab.simulator               # dry-run replay: gate -> detect -> policy -> audit -> metrics
+python3 -m pytest -q                    # 149 tests
+python3 -m lab.metrics_server --seed    # /metrics + /health on 127.0.0.1:9102
+python3 -m lab.live_check               # live inference through the guard (skips if no endpoint)
+python3 -m lab.redteam_behavioral       # red-team the behavioral detectors + cumulative budget
 ```
 
 Runs on the Python standard library alone. `prometheus_client` is optional.
@@ -372,8 +431,9 @@ Artifacts land in `lab/out/` (`audit.jsonl`, `memory.json`).
 | `test_allowlist_adversarial.py` | 24 known bypass techniques denied, allowed host permitted, userinfo does not change the host, CIDR entries, suffix spoof, control chars rejected |
 | `test_redirect.py` | default does not follow redirects (sink unhit), validated redirect followed when target allowed, validated redirect refuses disallowed target, original URL still authorized |
 | `test_simulator.py` | replay runs and verifies, artifacts written, replay is provably dry-run |
+| `test_cumulative_budget.py` | budget caps total actions and token cost, the crossing action consumes nothing, misconfiguration fails closed, concurrent charge admits exactly capacity, single spike still caught (MAD regression), **sustained elevation evades spend anomaly (measured ceiling locked)**, guard denies at cap, silent-hijack scenario bounded by the budget while detectors stay blind, deny is attributed and recorded |
 
-Run: `python3 -m pytest -q` → **137 passed**.
+Run: `python3 -m pytest -q` → **149 passed**.
 
 ## Defects the tests caught
 

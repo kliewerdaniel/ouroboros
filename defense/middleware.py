@@ -19,6 +19,7 @@ from typing import Any, Callable, Optional
 
 from authz import AuthorizationError, Gate
 from defense.audit import Audit, AuditLog, NullAudit, Witness
+from defense.cumulative_budget import BudgetDecision, CumulativeBudget
 from defense.detectors import DetectionReport
 from defense.metrics import Metrics
 from defense.policy_engine import Policy, PolicyEngine, Ruling
@@ -49,6 +50,7 @@ class InferenceGuard:
         metrics: Optional[Metrics] = None,
         on_deny: str = "raise",
         rate_limit: Optional[RateLimit] = None,
+        budget: Optional["CumulativeBudget"] = None,
         witness: Optional["Witness"] = None,
     ) -> None:
         self.gate = gate or Gate()
@@ -56,6 +58,7 @@ class InferenceGuard:
         self.audit: Audit = audit if audit is not None else NullAudit()
         self.metrics = metrics
         self.rate_limit = rate_limit
+        self.budget = budget
         self.witness = witness
         if on_deny not in ("raise", "return"):
             raise ValueError("on_deny must be 'raise' or 'return'")
@@ -71,7 +74,8 @@ class InferenceGuard:
 
     # -- decision + effect --------------------------------------------------
     def execute(self, action: str, payload: str, fn: Callable, *args: Any,
-                step: int = 0, key: Optional[str] = None, **kwargs: Any) -> Outcome:
+                step: int = 0, key: Optional[str] = None,
+                cost: float = 1.0, **kwargs: Any) -> Outcome:
         ruling = self.guard(action, payload)
 
         step_ok = self.gate.authorize_step(step)
@@ -108,6 +112,22 @@ class InferenceGuard:
             elif self.metrics:
                 self.metrics.set_gauge("rate_limit_remaining",
                                        self.rate_limit.remaining(key or action))
+
+        # The cumulative budget is the last check: an absolute ceiling on TOTAL
+        # spend over the session, independent of the rate limiter (which caps
+        # speed, not volume). This is what bounds a slow, at-rate hijack that the
+        # spend anomaly detector misses -- the median shifts under a sustained
+        # elevation, so the detector is quiet while the running total climbs.
+        # `cost` is the token/accounted spend of this action; default 1 = per call.
+        budget_dec: Optional[BudgetDecision] = None
+        if permitted and self.budget is not None:
+            budget_dec = self.budget.charge(cost)
+            if not budget_dec.allowed:
+                reasons.append(budget_dec.reason)
+                permitted = False
+            elif self.metrics:
+                self.metrics.set_gauge("cumulative_budget_remaining",
+                                       self.budget.remaining())
 
         if not permitted:
             # Record the ACTUAL cause. ruling.reason is the policy's verdict and
